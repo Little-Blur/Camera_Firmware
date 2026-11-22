@@ -1927,6 +1927,24 @@ def brush_frames(scene):
     return sum(1 for _ in out.glob("frame_*.ply")) if out.is_dir() else 0
 
 
+def gpu_choices(names):
+    """(CUBECL_WGPU_DEFAULT_DEVICE value, label) per GPU from the system's adapter names, for
+    Brush: it runs on wgpu, which takes no CUDA_VISIBLE_DEVICES, but its compute backend (cubecl)
+    reads that variable when the app asks for the default device, as brush-cli does. A GPU is
+    named by kind and number: DiscreteGpu(1) is the second discrete GPU."""
+    integrated = re.compile(r"Intel.*(UHD|HD Graphics|Iris)|Radeon\(TM\) Graphics|Radeon Graphics$|Vega \d+ Graphics")
+    names = [n for n in names if n and "Microsoft Basic" not in n and "Remote Display" not in n]
+    out, count, seen = [], {"DiscreteGpu": 0, "IntegratedGpu": 0}, {}
+    for name in names:
+        kind = "IntegratedGpu" if integrated.search(name) else "DiscreteGpu"
+        seen[name] = seen.get(name, 0) + 1
+        # identical cards (2x RTX 3090) get a number: #1 is the one listed first
+        label = name + (f" #{seen[name]}" if names.count(name) > 1 else "")
+        out.append((f"{kind}({count[kind]})", label + ("  (integrated)" if kind == "IntegratedGpu" else "")))
+        count[kind] += 1
+    return out
+
+
 class BrushRunner(QObject):
     """Gaussian splatting with Brush (brush-cli), one splat per frame: a PLY sequence
     <scene>/splats/brush/frame_000001.ply … from the SfM frames <scene>/point/colmap_<n>. All SfM
@@ -1935,11 +1953,14 @@ class BrushRunner(QObject):
     the dataset folder) and needs fewer steps than a cold start from the COLMAP points. The first
     frame of the chosen range is always cold, and with a keyframe interval every Nth frame of the
     range is cold again (like a video I-frame), so warm-start drift can't build up.
+    A cold frame and the warm frames after it are a group: they depend on each other and train in
+    order, but groups don't, so each GPU (slot) takes the next waiting group and several groups
+    train at once. One slot = one frame at a time, the way it was before.
     Each frame trains in a clean work folder (images/ links, sparse/0, init.ply): pointed at
     colmap_<n> itself, Brush would pick distorted/sparse/0 (on a tie it takes the first path) and
-    would take any .ply it finds as the starting splats. One frame at a time: it uses the GPU.
-    Pause freezes brush-cli where it is (its GPU memory stays allocated) and holds the queue;
-    resume carries on with the same frame from the same step."""
+    would take any .ply it finds as the starting splats.
+    Pause freezes every brush-cli where it is (their GPU memory stays allocated) and holds the
+    queue; resume carries on with the same frames from the same step."""
     changed = Signal()
     message = Signal(str)
 
@@ -1947,49 +1968,59 @@ class BrushRunner(QObject):
         super().__init__(parent)
         self.program = str(BRUSH_DEFAULT)
         self.flavor = {"steps": "--total-train-iters", "distortion": True}   # brush_flavor(program)
-        self.queue = []      # jobs: {"scene", "data" (colmap_<n>), "ply", "prev", "opts"}
-        self.job = None
-        self.proc = None
+        self.queue = []      # groups waiting for a slot: [[job, …], …], jobs {"scene", "data", "ply", "prev", "opts"}
+        self.slots = []
+        self.set_gpus([("", "default GPU")])
         self.scenes = {}     # scene -> {"total", "done", "ok", "splats", "bytes", "failed"}
         self.paused = False
 
+    def set_gpus(self, gpus):
+        """One slot per (CUBECL_WGPU_DEFAULT_DEVICE value, label); "" = Brush's own choice. Only
+        while idle."""
+        self.slots = [{"gpu": gpu, "label": label, "group": [], "job": None, "proc": None}
+                      for gpu, label in gpus]
+
     def busy(self):
-        return bool(self.queue or self.job)
+        return bool(self.queue or any(s["job"] or s["group"] for s in self.slots))
 
     def pause(self, on):
-        """Freeze (on) or thaw the running brush-cli; while paused no new frame starts."""
+        """Freeze (on) or thaw every running brush-cli; while paused no new frame starts."""
         if on == self.paused:
             return
-        if self.proc and self.proc.processId():
-            try:
-                suspend_process(self.proc.processId(), on)
-            except OSError as e:
-                return self.message.emit(f"Brush: can't {'pause' if on else 'resume'}: {e}")
+        for slot in self.slots:
+            if slot["proc"] and slot["proc"].processId():
+                try:
+                    suspend_process(slot["proc"].processId(), on)
+                except OSError as e:
+                    self.message.emit(f"Brush ({slot['label']}): can't {'pause' if on else 'resume'}: {e}")
         self.paused = on
         self.message.emit("Brush training paused" if on else "Brush training resumed")
-        if not on and not self.job:
+        if not on:
             QTimer.singleShot(0, self._next)
         self.changed.emit()
 
-    def _started(self, proc):
+    def _started(self, slot, proc):
         """Paused while brush-cli was still starting: freeze it as soon as it runs."""
-        if proc is self.proc and self.paused:
+        if proc is slot["proc"] and self.paused:
             try:
                 suspend_process(proc.processId(), True)
             except OSError as e:
                 self.message.emit(f"Brush: can't pause: {e}")
 
     def busy_scenes(self):
-        return {j["scene"] for j in self.queue} | ({self.job["scene"]} if self.job else set())
+        jobs = [j for g in self.queue for j in g] + [j for s in self.slots for j in s["group"]]
+        return {j["scene"] for j in jobs} | {s["job"]["scene"] for s in self.slots if s["job"]}
 
     def add_scene(self, scene, opts, redo):
+        """Queue the scene's frames in opts' range. Returns (frames, groups) queued."""
         frames = sfm_frame_dirs(scene, opts["first"], opts["last"])
         if not frames:
-            return 0
+            return 0, 0
         out = scene / "splats" / "brush"
         plys = [brush_ply(scene, d) for d in frames]
         if redo:   # only the chosen range: other ranges' PLYs stay
-            shutil.rmtree(out / ".work", ignore_errors=True)
+            for work in out.glob(".work*"):
+                shutil.rmtree(work, ignore_errors=True)
             for ply in plys:
                 ply.unlink(missing_ok=True)
                 (out / "logs" / f"{ply.stem}.log").unlink(missing_ok=True)
@@ -1997,49 +2028,71 @@ class BrushRunner(QObject):
         (out / "brush.json").write_text(json.dumps(opts, indent=1) + "\n")
         # Warm start from the previous SfM frame, whatever the gap (lower frame rates skip numbers),
         # except the range's first frame and every keyframe-th one after it: those start cold
+        # and begin a new group. Frames that already have a PLY drop out (their PLY is still the
+        # next frame's start), so a half-done group carries on where it stopped.
         key = opts["keyframe"]
-        jobs = [{"scene": scene, "data": d, "ply": ply, "opts": opts,
-                 "prev": plys[i - 1] if i and not (key and i % key == 0) else None}
-                for i, (d, ply) in enumerate(zip(frames, plys))]
-        jobs = [j for j in jobs if not j["ply"].exists()]
-        if jobs:
-            self.scenes[scene] = {"total": len(jobs), "done": 0, "ok": 0, "splats": 0, "bytes": 0,
-                                  "failed": []}
-            self.queue += jobs
+        groups = []
+        for i, (d, ply) in enumerate(zip(frames, plys)):
+            cold = not i or (key and i % key == 0)
+            if cold:
+                groups.append([])
+            groups[-1].append({"scene": scene, "data": d, "ply": ply, "opts": opts,
+                               "prev": None if cold else plys[i - 1]})
+        groups = [g for g in ([j for j in g if not j["ply"].exists()] for g in groups) if g]
+        n = sum(len(g) for g in groups)
+        if n:
+            self.scenes[scene] = {"total": n, "done": 0, "ok": 0, "splats": 0, "bytes": 0, "failed": []}
+            self.queue += groups
             QTimer.singleShot(0, self._next)
-        return len(jobs)
+        return n, len(groups)
 
     def progress(self):
         active = [s for s in self.scenes.values() if s["done"] < s["total"]]
         total = sum(s["total"] for s in active) or 1
         done = sum(s["done"] for s in active)
-        now = ""
-        if self.job:
-            j = self.job
-            done += min(j["iter"] / j["steps"], 1)
-            now = (f" · {j['scene'].name}/{j['ply'].stem}: {'warm' if j['warm'] else 'cold'} "
-                   f"{j['iter']}/{j['steps']} steps, {j['splats']:,} splats")
-        return done / total, f"{'PAUSED · ' if self.paused else ''}{len(self.queue) + bool(self.job)} frame(s) left{now}"
+        now = []
+        for slot in self.slots:
+            j = slot["job"]
+            if j:
+                done += min(j["iter"] / j["steps"], 1)
+                gpu = f"{slot['label']}: " if len(self.slots) > 1 else ""
+                now.append(f"{gpu}{j['scene'].name}/{j['ply'].stem} {'warm' if j['warm'] else 'cold'} "
+                           f"{j['iter']}/{j['steps']} steps, {j['splats']:,} splats")
+        left = sum(len(g) for g in self.queue) + sum(len(s["group"]) + bool(s["job"]) for s in self.slots)
+        return done / total, (f"{'PAUSED · ' if self.paused else ''}{left} frame(s) left"
+                              + "".join(f"<br>{n}" if len(now) > 1 else f" · {n}" for n in now))
 
     def cancel(self):
         self.queue.clear()
         self.paused = False   # a suspended process can still be killed
-        job, self.job = self.job, None
-        if self.proc:
-            self.proc.kill()
-            self.proc.waitForFinished(5000)
-        if job:
-            shutil.rmtree(job["work"], ignore_errors=True)
+        for slot in self.slots:
+            job, proc = slot["job"], slot["proc"]
+            slot.update(group=[], job=None, proc=None)
+            if proc:
+                proc.kill()
+                proc.waitForFinished(5000)
+            if job:
+                shutil.rmtree(job["work"], ignore_errors=True)
         self.message.emit("Brush training cancelled")
         self.changed.emit()
 
     def _next(self):
-        if self.job or not self.queue or self.paused:
-            return self.changed.emit()
-        job = self.job = self.queue.pop(0)
+        """Give every idle slot its group's next frame, or the next waiting group."""
+        if not self.paused:
+            for slot in self.slots:
+                if slot["job"]:
+                    continue
+                if not slot["group"] and self.queue:
+                    slot["group"] = self.queue.pop(0)
+                if slot["group"]:
+                    self._start(slot, slot["group"].pop(0))
+        self.changed.emit()
+
+    def _start(self, slot, job):
+        slot["job"] = job
         opts = job["opts"]
         out = job["ply"].parent
-        work = job["work"] = out / ".work"
+        work = job["work"] = out / f".work_{job['ply'].stem}"
         prev = job["prev"]
         job["warm"] = bool(opts["warm"] and prev and prev.exists())
         job["steps"] = opts["steps_next"] if job["warm"] else opts["steps_first"]
@@ -2067,11 +2120,13 @@ class BrushRunner(QObject):
             max_res = max(64, round(colmap_longest_side(work / "sparse" / "0" / "cameras.bin")
                                     / opts["downscale"]))
         except (OSError, KeyError, struct.error) as e:
-            return self._failed(f"work folder: {e}")
+            return self._failed(slot, f"work folder: {e}")
         steps = job["steps"]
-        proc = self.proc = QProcess(self)
+        proc = slot["proc"] = QProcess(self)
         env = QProcessEnvironment.systemEnvironment()
         env.insert("RUST_LOG", "info")   # "Refine iter N, X splats." every refine: the progress
+        if slot["gpu"]:
+            env.insert("CUBECL_WGPU_DEFAULT_DEVICE", slot["gpu"])
         proc.setProcessEnvironment(env)
         proc.setProgram(self.program)
         proc.setArguments([
@@ -2084,41 +2139,41 @@ class BrushRunner(QObject):
             "--export-name", "result.ply"])
         proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         job["log"] = []
-        proc.readyReadStandardOutput.connect(lambda p=proc: self._read(p))
-        proc.finished.connect(lambda code, _s, p=proc: self._finished(p, code))
-        proc.started.connect(lambda p=proc: self._started(p))
-        proc.errorOccurred.connect(lambda err, p=proc: err == QProcess.ProcessError.FailedToStart
-                                   and self._finished(p, -1))
+        proc.readyReadStandardOutput.connect(lambda s=slot, p=proc: self._read(s, p))
+        proc.finished.connect(lambda code, _s, s=slot, p=proc: self._finished(s, p, code))
+        proc.started.connect(lambda s=slot, p=proc: self._started(s, p))
+        proc.errorOccurred.connect(lambda err, s=slot, p=proc: err == QProcess.ProcessError.FailedToStart
+                                   and self._finished(s, p, -1))
         proc.start()
-        self.changed.emit()
 
-    def _read(self, proc):
-        if proc is not self.proc or not self.job:
+    def _read(self, slot, proc):
+        if proc is not slot["proc"] or not slot["job"]:
             return
         text = bytes(proc.readAllStandardOutput()).decode(errors="replace")
-        self.job["log"].append(text)
+        slot["job"]["log"].append(text)
         for m in REFINE_LINE.finditer(text):
-            self.job["iter"], self.job["splats"] = int(m[1]), int(m[2])
+            slot["job"]["iter"], slot["job"]["splats"] = int(m[1]), int(m[2])
         self.changed.emit()
 
-    def _finished(self, proc, code):
-        if proc is not self.proc:
+    def _finished(self, slot, proc, code):
+        if proc is not slot["proc"]:
             return
-        self._read(proc)
-        self.proc = None
+        self._read(slot, proc)
+        slot["proc"] = None
         proc.deleteLater()
-        job = self.job
+        job = slot["job"]
         if job is None:
             return  # cancelled
         log = "".join(job["log"])
         logs = job["ply"].parent / "logs"
         logs.mkdir(exist_ok=True)
+        gpu = f"CUBECL_WGPU_DEFAULT_DEVICE={slot['gpu']} ({slot['label']}) " if slot["gpu"] else ""
         (logs / f"{job['ply'].stem}.log").write_text(
-            f"brush-cli {' '.join(proc.arguments())}\n\n{log}", encoding="utf-8")
+            f"{gpu}brush-cli {' '.join(proc.arguments())}\n\n{log}", encoding="utf-8")
         result = job["work"] / "export" / "result.ply"
         if code != 0 or not result.exists():
             lines = [line for line in log.splitlines() if line.strip()]
-            return self._failed("brush-cli not found or won't start (choose it with Brush…)" if code == -1
+            return self._failed(slot, "brush-cli not found or won't start (choose it with Brush…)" if code == -1
                                 else lines[-1][-200:] if lines else f"exit {code}, no PLY written")
         os.replace(result, job["ply"])
         shutil.rmtree(job["work"], ignore_errors=True)
@@ -2126,14 +2181,15 @@ class BrushRunner(QObject):
         s["ok"] += 1
         s["splats"] += ply_splats(job["ply"])
         s["bytes"] += job["ply"].stat().st_size
-        self._done(job)
+        self._done(slot, job)
 
-    def _failed(self, why):
-        job = self.job
-        self.scenes[job["scene"]]["failed"].append(f"{job['ply'].stem}: {why}")
-        self._done(job)
+    def _failed(self, slot, why):
+        job = slot["job"]
+        gpu = f" on {slot['label']}" if len(self.slots) > 1 else ""
+        self.scenes[job["scene"]]["failed"].append(f"{job['ply'].stem}{gpu}: {why}")
+        self._done(slot, job)
 
-    def _done(self, job):
+    def _done(self, slot, job):
         s = self.scenes[job["scene"]]
         s["done"] += 1
         if s["done"] >= s["total"]:
@@ -2144,8 +2200,8 @@ class BrushRunner(QObject):
                 f"{job['scene'].name}: Brush {s['ok']}/{s['total']} frame(s) in splats/brush/{per}"
                 + (f" · FAILED {'; '.join(failed[:3])}" + (f" (+{len(failed) - 3} more)" if len(failed) > 3
                                                           else "") if failed else ""))
-        self.job = None
-        QTimer.singleShot(0, self._next)
+        slot["job"] = None
+        QTimer.singleShot(0, self._next)   # not recursive: a run of failing frames
 
 
 class PreparePanel(QWidget):
@@ -2347,6 +2403,21 @@ class PreparePanel(QWidget):
         self.train_cancel_btn.setToolTip("Stop training: finished PLYs stay, the current frame is dropped\n"
                                          "(Train again with Keep, add missing to carry on)")
         self.train_cancel_btn.clicked.connect(self.brush.cancel)
+        # GPUs: the first trains as before; a second one trains another cold-start group at the
+        # same time. Filled from the system's adapters by _probe_gpus
+        self.gpu = QComboBox()
+        self.gpu.setToolTip("GPU Brush trains on. Default = Brush's own choice (the fastest it finds)")
+        self.gpu2 = QComboBox()
+        self.gpu2.setToolTip("A second GPU trains another cold-start group at the same time: groups are\n"
+                             "independent (a cold frame and the warm frames after it), so set Cold every\n"
+                             "to have more than one. None = one frame at a time.\n"
+                             "The same GPU twice runs two trainings on it (twice the GPU memory)")
+        for combo in (self.gpu, self.gpu2):
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(8)
+            combo.activated.connect(self._save_gpus)
+        self._fill_gpus([])
+        self._probe_gpus()
 
         for combo in (self.fmt, self.lens):   # long item texts: don't let them widen the column
             combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
@@ -2384,7 +2455,8 @@ class PreparePanel(QWidget):
                           [("Frames from", pair(self.train_first, "to", self.train_last)),
                            ("Cold every", self.keyframe), ("Steps cold", self.steps_first),
                            ("Steps warm", self.steps_next), ("", pair(self.warm, self.hold)),
-                           ("Detail", self.sh), ("Max splats", self.max_splats), ("Resolution", self.scale)],
+                           ("Detail", self.sh), ("Max splats", self.max_splats), ("Resolution", self.scale),
+                           ("GPU", self.gpu), ("2nd GPU", self.gpu2)],
                           # while Brush runs, Pause and Cancel take the place of Train and Brush…
                           [self.train_btn, self.brush_btn, self.pause_btn, self.train_cancel_btn])
         self.bar = QProgressBar(maximum=1000)
@@ -2620,10 +2692,45 @@ class PreparePanel(QWidget):
                 "steps_first": self.steps_first.value(), "steps_next": self.steps_next.value(),
                 "warm": self.warm.isChecked(), "hold_count": self.hold.isChecked(), "sh": self.sh.currentData(),
                 "max_splats": self.max_splats.value() * 1000, "downscale": self.scale.currentData()}
-        n = sum(self.brush.add_scene(s, opts, redo) for s in ready)
-        self.message.emit(f"Brush: training {n} frame(s), {span}" if n else
+        gpus = [(self.gpu.currentData() or "", self.gpu.currentText())]
+        if self.gpu2.currentData() is not None:
+            gpus.append((self.gpu2.currentData(), self.gpu2.currentText()))
+        if not self.brush.busy():
+            self.brush.set_gpus(gpus)
+        queued = [self.brush.add_scene(s, opts, redo) for s in ready]
+        n, groups = sum(q[0] for q in queued), sum(q[1] for q in queued)
+        parallel = (f" in {groups} cold-start group(s) on {len(self.brush.slots)} GPUs"
+                    + (" (one group: the second GPU waits; set Cold every)" if groups == 1 else "")
+                    if len(self.brush.slots) > 1 else "")
+        self.message.emit(f"Brush: training {n} frame(s), {span}{parallel}" if n else
                           f"Brush: nothing to do, every SfM frame in {span} has a PLY")
         self.refresh()
+
+    def _probe_gpus(self):
+        """The system's display adapters, without holding up the window (PowerShell takes ~1 s)."""
+        if os.name != "nt":
+            return
+        proc = QProcess(self)
+        proc.finished.connect(lambda *_: self._fill_gpus(
+            bytes(proc.readAllStandardOutput()).decode(errors="replace").splitlines()))
+        proc.start("powershell", ["-NoProfile", "-Command", "(Get-CimInstance Win32_VideoController).Name"])
+
+    def _fill_gpus(self, names):
+        found = gpu_choices([n.strip() for n in names])
+        for combo, first, key in ((self.gpu, ("Default", ""), "brush_gpu"), (self.gpu2, ("None", None), "brush_gpu2")):
+            saved = self.settings.value(key, first[1])
+            combo.clear()
+            combo.addItem(*first)
+            for value, label in found:
+                combo.addItem(label, value)
+            combo.setCurrentIndex(max(0, combo.findData(saved)) if saved is not None else 0)
+
+    def _save_gpus(self):
+        self.settings.setValue("brush_gpu", self.gpu.currentData() or "")
+        if self.gpu2.currentData() is None:
+            self.settings.remove("brush_gpu2")
+        else:
+            self.settings.setValue("brush_gpu2", self.gpu2.currentData())
 
     def _cancel(self):
         for runner in (self.extractor, self.sfm):
