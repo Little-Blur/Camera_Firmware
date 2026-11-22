@@ -1,0 +1,13 @@
+[Unit]
+Description=Camera rig: static IP from /etc/camrig/camera.json
+After=NetworkManager.service
+Wants=NetworkManager.service
+Before=camd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/camrig-net
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+[Unit]
+Description=Camera rig daemon (camd)
+After=network-online.target camrig-net.service
+Wants=network-online.target
+
+[Service]
+User=cam1
+Group=cam1
+SupplementaryGroups=video
+ExecStart=/usr/bin/python3 /home/cam1/camd/camd.py
+Environment=PYTHONUNBUFFERED=1
+# Hides the 2-plane NM12 format so the encoder imports ISP buffers directly (no CPU copy)
+Environment=LD_PRELOAD=/home/cam1/camd/hide_nm12.so
+Restart=on-failure
+RestartSec=3
+# SIGTERM makes camd finish any recording (EOS -> complete MKV) before exiting
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

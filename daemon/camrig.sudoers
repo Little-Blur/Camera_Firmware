@@ -1,0 +1,2 @@
+# camd (user cam1) may apply the network config and reboot/power off the camera, nothing else
+cam1 ALL=(root) NOPASSWD: /usr/local/sbin/camrig-net, /usr/bin/systemctl reboot, /usr/bin/systemctl poweroff

@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""camrig-net: apply /etc/camrig/camera.json to the wired network (runs as root).
+
+Every camera runs the same image. The config file decides who the camera is:
+  {"ip": "192.168.1.150"}                      -> static 192.168.1.150 (camera cam150)
+  optional: "prefix": 23, "gateway": "192.168.1.1", "dns": ["192.168.1.1"]
+  no file / no "ip" / invalid                  -> BASE_IP: an unconfigured ("NEW") camera
+
+Runs at boot (camrig-net.service, after NetworkManager) and from camd through sudo when the
+IP is changed from the client. It owns one NetworkManager profile, "camrig", with a higher
+autoconnect priority than the default DHCP profile, so the static address wins at boot.
+"""
+import glob
+import ipaddress
+import json
+import os
+import subprocess
+import sys
+
+CONF = "/etc/camrig/camera.json"
+BASE_IP = "192.168.0.5"
+DEFAULTS = {"prefix": 23, "gateway": "192.168.1.1", "dns": ["192.168.1.1"]}
+PROFILE = "camrig"
+
+
+def nmcli(*args, check=True):
+    return subprocess.run(["nmcli", *args], capture_output=True, text=True, check=check).stdout
+
+
+def wanted():
+    try:
+        with open(CONF) as f:
+            conf = json.load(f)
+    except (OSError, ValueError):
+        conf = {}
+    cfg = {**DEFAULTS, **{k: v for k, v in conf.items() if k in DEFAULTS}}
+    try:
+        net = ipaddress.ip_interface(f"{conf['ip']}/{int(cfg['prefix'])}")
+        ipaddress.ip_address(cfg["gateway"])
+        for d in cfg["dns"]:
+            ipaddress.ip_address(d)
+        if net.ip.version != 4 or net.ip in (net.network.network_address, net.network.broadcast_address):
+            raise ValueError
+    except (KeyError, ValueError, TypeError):
+        net = ipaddress.ip_interface(f"{BASE_IP}/{DEFAULTS['prefix']}")
+        cfg = dict(DEFAULTS)
+    return net, cfg
+
+
+def ethernet_device():
+    for line in nmcli("-t", "-f", "DEVICE,TYPE", "device").splitlines():
+        dev, _, kind = line.rpartition(":")
+        if kind == "ethernet":
+            return dev
+    sys.exit("camrig-net: no ethernet device")
+
+
+def heal_boot_sd():
+    """The boot SD image (900 MiB) is smaller than the card. Orange Pi's U-Boot then moves the
+    backup GPT to the end of the card and leaves the primary table corrupt. U-Boot copes, but the
+    kernel ignores the backup, sees no partition, and /boot (fstab, nofail) is silently not mounted.
+    Rewrite both tables from the backup, re-read and mount. Never fatal for the network setup."""
+    for blk in sorted(glob.glob("/sys/block/mmcblk[0-9]")):
+        dev = "/dev/" + os.path.basename(blk)
+        if glob.glob(blk + "/mmcblk*p1"):
+            continue  # kernel sees partitions: fine
+        try:
+            dump = subprocess.run(["sfdisk", "-d", dev], capture_output=True, text=True)
+            if "label: gpt" not in dump.stdout:
+                continue
+            repaired = "primary GPT table is corrupt" in dump.stderr
+            if repaired:
+                subprocess.run(["sfdisk", "--wipe", "never", "--no-reread", dev], input=dump.stdout,
+                               text=True, capture_output=True, check=True)
+            # The kernel only reads the table at card detection: re-read it either way
+            subprocess.run(["blockdev", "--rereadpt", dev], check=True)
+            subprocess.run(["udevadm", "settle"])
+            print(f"camrig-net: {'repaired the GPT on' if repaired else 're-read'} {dev}")
+        except (OSError, subprocess.CalledProcessError) as e:
+            print(f"camrig-net: could not repair the GPT on {dev}: {e}")
+    # fstab mounts these with nofail: if the partition showed up late, mount them now (once)
+    for mnt in ("/media/boot-media", "/boot"):
+        if subprocess.run(["findmnt", mnt], capture_output=True).returncode != 0:
+            r = subprocess.run(["mount", mnt], capture_output=True, text=True)
+            print(f"camrig-net: mount {mnt}: {'ok' if r.returncode == 0 else r.stderr.strip()}")
+
+
+def main():
+    heal_boot_sd()
+    net, cfg = wanted()
+    dev = ethernet_device()
+    if PROFILE not in nmcli("-t", "-f", "NAME", "connection").splitlines():
+        nmcli("connection", "add", "type", "ethernet", "con-name", PROFILE, "ifname", dev)
+    nmcli("connection", "modify", PROFILE,
+          "connection.interface-name", dev,
+          "connection.autoconnect", "yes", "connection.autoconnect-priority", "100",
+          "ipv4.method", "manual", "ipv4.addresses", str(net),
+          "ipv4.gateway", cfg["gateway"], "ipv4.dns", ",".join(cfg["dns"]),
+          "ipv6.method", "disabled")
+    active = nmcli("-g", "GENERAL.CONNECTION,IP4.ADDRESS", "device", "show", dev, check=False)
+    if PROFILE not in active or str(net) not in active:
+        nmcli("connection", "up", PROFILE)
+    print(f"camrig-net: {dev} = {net} gw {cfg['gateway']}")
+
+
+if __name__ == "__main__":
+    main()
