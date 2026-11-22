@@ -14,10 +14,12 @@ The camera list:
 
   python camctl.py            cameras are listed in cameras.json next to this file
 """
+import ctypes
 import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import struct
 import subprocess
@@ -1871,6 +1873,24 @@ def brush_flavor(exe):
     raise ValueError(f"{Path(exe).name}: unknown Brush version (no step-count option in --help)")
 
 
+def suspend_process(pid, suspend=True):
+    """Freeze or thaw a running process (all its threads) without ending it. Windows has no
+    SIGSTOP: ntdll's NtSuspendProcess / NtResumeProcess do the same."""
+    if os.name != "nt":
+        return os.kill(pid, signal.SIGSTOP if suspend else signal.SIGCONT)
+    kernel32, ntdll = ctypes.windll.kernel32, ctypes.windll.ntdll
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    handle = kernel32.OpenProcess(0x0800, False, pid)   # PROCESS_SUSPEND_RESUME
+    if not handle:
+        raise OSError(f"can't open process {pid}")
+    try:
+        status = (ntdll.NtSuspendProcess if suspend else ntdll.NtResumeProcess)(ctypes.c_void_p(handle))
+        if status:
+            raise OSError(f"{'suspend' if suspend else 'resume'} failed (NTSTATUS {status & 0xffffffff:#x})")
+    finally:
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+
+
 def ply_splats(path):
     """Splat count from a PLY header ("element vertex N")."""
     with open(path, "rb") as f:
@@ -1887,6 +1907,21 @@ def scene_undistorted(scene):
         return True
 
 
+def sfm_frame_dirs(scene, first=1, last=0):
+    """The scene's finished SfM frames (point/colmap_<n>) from frame `first` to `last` (0 = the
+    last one), in frame order. Each has its own sparse/0 with the take's cameras (intrinsics and
+    poses), so training can start at any of them."""
+    point = scene / "point"
+    frames = (d for d in point.glob("colmap_*") if (d / "sparse" / "0" / "points3D.bin").exists()) \
+        if point.is_dir() else ()
+    return sorted((d for d in frames if first <= frame_number(d) and (not last or frame_number(d) <= last)),
+                  key=frame_number)
+
+
+def brush_ply(scene, colmap_dir):
+    return scene / "splats" / "brush" / f"frame_{frame_number(colmap_dir):06d}.ply"
+
+
 def brush_frames(scene):
     out = scene / "splats" / "brush"
     return sum(1 for _ in out.glob("frame_*.ply")) if out.is_dir() else 0
@@ -1897,10 +1932,14 @@ class BrushRunner(QObject):
     <scene>/splats/brush/frame_000001.ply … from the SfM frames <scene>/point/colmap_<n>. All SfM
     frames share one coordinate system, so the PLYs line up as volumetric video.
     Warm start: a frame begins from the previous frame's trained splats (Brush loads an init.ply in
-    the dataset folder) and needs fewer steps than a cold start from the COLMAP points.
+    the dataset folder) and needs fewer steps than a cold start from the COLMAP points. The first
+    frame of the chosen range is always cold, and with a keyframe interval every Nth frame of the
+    range is cold again (like a video I-frame), so warm-start drift can't build up.
     Each frame trains in a clean work folder (images/ links, sparse/0, init.ply): pointed at
     colmap_<n> itself, Brush would pick distorted/sparse/0 (on a tie it takes the first path) and
-    would take any .ply it finds as the starting splats. One frame at a time: it uses the GPU."""
+    would take any .ply it finds as the starting splats. One frame at a time: it uses the GPU.
+    Pause freezes brush-cli where it is (its GPU memory stays allocated) and holds the queue;
+    resume carries on with the same frame from the same step."""
     changed = Signal()
     message = Signal(str)
 
@@ -1912,26 +1951,55 @@ class BrushRunner(QObject):
         self.job = None
         self.proc = None
         self.scenes = {}     # scene -> {"total", "done", "ok", "splats", "bytes", "failed"}
+        self.paused = False
 
     def busy(self):
         return bool(self.queue or self.job)
+
+    def pause(self, on):
+        """Freeze (on) or thaw the running brush-cli; while paused no new frame starts."""
+        if on == self.paused:
+            return
+        if self.proc and self.proc.processId():
+            try:
+                suspend_process(self.proc.processId(), on)
+            except OSError as e:
+                return self.message.emit(f"Brush: can't {'pause' if on else 'resume'}: {e}")
+        self.paused = on
+        self.message.emit("Brush training paused" if on else "Brush training resumed")
+        if not on and not self.job:
+            QTimer.singleShot(0, self._next)
+        self.changed.emit()
+
+    def _started(self, proc):
+        """Paused while brush-cli was still starting: freeze it as soon as it runs."""
+        if proc is self.proc and self.paused:
+            try:
+                suspend_process(proc.processId(), True)
+            except OSError as e:
+                self.message.emit(f"Brush: can't pause: {e}")
 
     def busy_scenes(self):
         return {j["scene"] for j in self.queue} | ({self.job["scene"]} if self.job else set())
 
     def add_scene(self, scene, opts, redo):
-        frames = sorted((d for d in (scene / "point").glob("colmap_*")
-                         if (d / "sparse" / "0" / "points3D.bin").exists()), key=frame_number)
+        frames = sfm_frame_dirs(scene, opts["first"], opts["last"])
         if not frames:
             return 0
         out = scene / "splats" / "brush"
-        if redo:
-            shutil.rmtree(out, ignore_errors=True)
+        plys = [brush_ply(scene, d) for d in frames]
+        if redo:   # only the chosen range: other ranges' PLYs stay
+            shutil.rmtree(out / ".work", ignore_errors=True)
+            for ply in plys:
+                ply.unlink(missing_ok=True)
+                (out / "logs" / f"{ply.stem}.log").unlink(missing_ok=True)
         out.mkdir(parents=True, exist_ok=True)
         (out / "brush.json").write_text(json.dumps(opts, indent=1) + "\n")
-        # Warm start from the previous SfM frame, whatever the gap (lower frame rates skip numbers)
-        plys = [out / f"frame_{frame_number(d):06d}.ply" for d in frames]
-        jobs = [{"scene": scene, "data": d, "ply": ply, "prev": plys[i - 1] if i else None, "opts": opts}
+        # Warm start from the previous SfM frame, whatever the gap (lower frame rates skip numbers),
+        # except the range's first frame and every keyframe-th one after it: those start cold
+        key = opts["keyframe"]
+        jobs = [{"scene": scene, "data": d, "ply": ply, "opts": opts,
+                 "prev": plys[i - 1] if i and not (key and i % key == 0) else None}
                 for i, (d, ply) in enumerate(zip(frames, plys))]
         jobs = [j for j in jobs if not j["ply"].exists()]
         if jobs:
@@ -1951,10 +2019,11 @@ class BrushRunner(QObject):
             done += min(j["iter"] / j["steps"], 1)
             now = (f" · {j['scene'].name}/{j['ply'].stem}: {'warm' if j['warm'] else 'cold'} "
                    f"{j['iter']}/{j['steps']} steps, {j['splats']:,} splats")
-        return done / total, f"{len(self.queue) + bool(self.job)} frame(s) left{now}"
+        return done / total, f"{'PAUSED · ' if self.paused else ''}{len(self.queue) + bool(self.job)} frame(s) left{now}"
 
     def cancel(self):
         self.queue.clear()
+        self.paused = False   # a suspended process can still be killed
         job, self.job = self.job, None
         if self.proc:
             self.proc.kill()
@@ -1965,7 +2034,7 @@ class BrushRunner(QObject):
         self.changed.emit()
 
     def _next(self):
-        if self.job or not self.queue:
+        if self.job or not self.queue or self.paused:
             return self.changed.emit()
         job = self.job = self.queue.pop(0)
         opts = job["opts"]
@@ -2017,6 +2086,7 @@ class BrushRunner(QObject):
         job["log"] = []
         proc.readyReadStandardOutput.connect(lambda p=proc: self._read(p))
         proc.finished.connect(lambda code, _s, p=proc: self._finished(p, code))
+        proc.started.connect(lambda p=proc: self._started(p))
         proc.errorOccurred.connect(lambda err, p=proc: err == QProcess.ProcessError.FailedToStart
                                    and self._finished(p, -1))
         proc.start()
@@ -2099,43 +2169,90 @@ class PreparePanel(QWidget):
         self.brush.message.connect(lambda _: self.refresh())
         self.brush.changed.connect(self._progress)
 
+        # Left: the scenes, like the camera list on Capture (select several for batch work)
         self.folder = QLabel()
+        self.folder.setWordWrap(True)
         self.folder.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.folder.setStyleSheet(f"color:{GREY};")
         choose = QPushButton("Choose folder…")
         choose.clicked.connect(self._choose)
         refresh = QPushButton("Refresh")
         refresh.clicked.connect(self.refresh)
-        top = QHBoxLayout()
-        top.addWidget(QLabel("Scenes folder:"))
-        top.addWidget(self.folder, 1)
-        top.addWidget(choose)
-        top.addWidget(refresh)
-
-        self.table = make_table(["Scene", "Cameras", "Videos", "Frame folders", "SfM frames", "PLY frames"])
+        self.table = make_table(["Scene", "Videos", "Frames", "SfM", "PLY"])
+        self.table.setToolTip("Select one or more scenes: the buttons on the right work on every selected scene")
         self.table.doubleClicked.connect(lambda _: self._open())
+        self.table.itemSelectionChanged.connect(self._show_scene)
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(choose)
+        folder_row.addWidget(refresh)
+        folder_row.addStretch()
+        left = QWidget()
+        left_lay = QVBoxLayout(left)
+        left_lay.setContentsMargins(0, 0, 0, 0)
+        left_lay.addWidget(QLabel("Scenes folder"))
+        left_lay.addWidget(self.folder)
+        left_lay.addLayout(folder_row)
+        left_lay.addWidget(self.table, 1)
+        left.setMinimumWidth(380)
 
+        # Middle: the selected scene, its videos and how far it has come
+        self.scene_title = QLabel()
+        self.scene_title.setStyleSheet("font-size:16px; font-weight:600;")
+        self.video_table = make_table(["Camera", "File", "Size", "Recorded"], stretch=1)
+        self.video_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        videos_box = QGroupBox("Videos")
+        QVBoxLayout(videos_box).addWidget(self.video_table)
+        self.stages = {}
+        grid = QGridLayout()
+        for i, (key, label) in enumerate([("frames", "Frames"), ("sfm", "SfM"), ("ref", "Reference"),
+                                          ("ply", "Splats"), ("brush", "Last training")]):
+            grid.addWidget(QLabel(label), i, 0, Qt.AlignmentFlag.AlignTop)
+            self.stages[key] = QLabel("–")
+            self.stages[key].setWordWrap(True)
+            self.stages[key].setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            grid.addWidget(self.stages[key], i, 1)
+        grid.setColumnStretch(1, 1)
+        status_box = QGroupBox("Status")
+        status_box.setLayout(grid)
+        note = QLabel("Extract frames turns each scene's videos into <i>&lt;scene&gt;/frames/frame_000001/"
+                      "&lt;camera&gt;.jpg</i> …: one folder per moment with every camera's view of it, for "
+                      "COLMAP. Frames are numbered by their timestamp, so a frame one camera dropped "
+                      "leaves that camera out of one folder instead of shifting all its later frames. "
+                      "Use frame-synced takes: only then does one folder hold one moment.<br>"
+                      "SfM runs COLMAP on the reference frame to find every camera's pose and lens, then "
+                      "triangulates each frame's points with those same cameras, so all frames share one "
+                      "coordinate system: <i>&lt;scene&gt;/point/colmap_0/</i> … (images/ + sparse/0, "
+                      "undistorted) for Gaussian splatting trainers such as SpacetimeGaussians.<br>"
+                      "Train (Brush) trains one splat per SfM frame into <i>&lt;scene&gt;/splats/brush/"
+                      "frame_000001.ply</i> … for the chosen frame range: the range's first frame starts "
+                      "cold from its COLMAP points, the rest from the previous frame's splats (cold again "
+                      "every N frames with <i>cold every</i>).")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color:{GREY};")
+        open_btn = QPushButton("Open folder")
+        open_btn.clicked.connect(self._open)
+        open_row = QHBoxLayout()
+        open_row.addWidget(open_btn)
+        open_row.addStretch()
+        center = QWidget()
+        center_lay = QVBoxLayout(center)
+        center_lay.setContentsMargins(0, 0, 0, 0)
+        center_lay.addWidget(self.scene_title)
+        center_lay.addWidget(videos_box, 1)
+        center_lay.addWidget(status_box)
+        center_lay.addLayout(open_row)
+        center_lay.addWidget(note)
+
+        # Right: the workflow top to bottom, like the camera controls: 1 extract, 2 SfM, 3 train
         self.fmt = QComboBox()
         self.fmt.addItem("JPEG (high quality, ~0.5-2 MB per image at 4K)", "jpg")
         self.fmt.addItem("PNG (lossless, ~10-15 MB per image at 4K)", "png")
-        self.extract_btn = QPushButton("Extract frames")
-        self.extract_btn.setStyleSheet("QPushButton:enabled { font-weight:600; }")
-        self.extract_btn.clicked.connect(self._extract)
-        self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.clicked.connect(self._cancel)
-        open_btn = QPushButton("Open folder")
-        open_btn.clicked.connect(self._open)
-        actions = QHBoxLayout()
-        actions.addWidget(QLabel("Format"))
-        actions.addWidget(self.fmt)
         self.extract_fps = fps_box("Extract at this frame rate: every Nth source frame, N = source fps / this,\n"
                                    "chosen by timestamp (frame numbers keep counting source frames).\n"
                                    "all = every frame")
-        actions.addWidget(QLabel("FPS"))
-        actions.addWidget(self.extract_fps)
-        actions.addWidget(self.extract_btn)
-        actions.addWidget(self.cancel_btn)
-        actions.addWidget(open_btn)
-        actions.addStretch()
+        self.extract_btn = QPushButton("Extract frames")
+        self.extract_btn.setStyleSheet("QPushButton:enabled { font-weight:600; }")
+        self.extract_btn.clicked.connect(self._extract)
 
         # Structure from motion: which frames, which one fixes the cameras, lens model
         self.first = QSpinBox(minimum=1, maximum=999999, value=1)
@@ -2143,6 +2260,9 @@ class PreparePanel(QWidget):
         self.count = QSpinBox(minimum=0, maximum=999999, value=50)
         self.count.setSpecialValueText("all")
         self.count.setToolTip("How many frames from the first one (SpacetimeGaussians trains 50 at a time)")
+        self.sfm_fps = fps_box("Reconstruct at this frame rate, picked from the extracted frames by time\n"
+                               "(count = frames after that). all = every extracted frame.\n"
+                               "Brush trains every SfM frame, so this sets its frame rate too")
         self.ref = QSpinBox(minimum=0, maximum=999999, value=0)
         self.ref.setSpecialValueText("auto")
         self.ref.setToolTip("Reference frame: full SfM on this one fixes every camera for the take.\n"
@@ -2171,20 +2291,22 @@ class PreparePanel(QWidget):
         self.colmap_btn = QPushButton("COLMAP…")
         self.colmap_btn.clicked.connect(lambda: self._colmap(choose=True))
         self.colmap_btn.setToolTip(self.settings.value("colmap", "") or "choose colmap.exe")
-        sfm_row = QHBoxLayout()
-        self.sfm_fps = fps_box("Reconstruct at this frame rate, picked from the extracted frames by time\n"
-                               "(count = frames after that). all = every extracted frame.\n"
-                               "Brush trains every SfM frame, so this sets its frame rate too")
-        for w in (QLabel("Frames from"), self.first, QLabel("FPS"), self.sfm_fps, QLabel("count"), self.count,
-                  QLabel("reference"),
-                  self.ref, QLabel("lens"), self.lens, self.shared, self.undistort, self.sfm_btn, self.colmap_btn):
-            sfm_row.addWidget(w)
-        sfm_row.addStretch()
 
         # Brush: one splat per SfM frame -> PLY sequence. Splats, SH degree and resolution set
         # the size of every PLY (the data rate of the volumetric video)
+        self.train_first = QSpinBox(minimum=1, maximum=999999, value=1)
+        self.train_first.setToolTip("First frame to train (frame_000001 = 1): a cold start from that frame's\n"
+                                    "COLMAP points and cameras, wherever it sits in the take")
+        self.train_last = QSpinBox(minimum=0, maximum=999999, value=0)
+        self.train_last.setSpecialValueText("end")
+        self.train_last.setToolTip("Last frame to train (inclusive). end = the last SfM frame")
+        self.keyframe = QSpinBox(minimum=0, maximum=100000, value=0, suffix=" frames")
+        self.keyframe.setSpecialValueText("never")
+        self.keyframe.setToolTip("Cold start again every N trained frames of the range (like a video I-frame),\n"
+                                 "so warm-start drift can't build up. never = only the range's first frame")
         self.steps_first = QSpinBox(minimum=1000, maximum=200000, singleStep=1000, value=30000)
-        self.steps_first.setToolTip("Training steps for a cold start (first frame, from the COLMAP points)")
+        self.steps_first.setToolTip("Training steps for a cold start (first frame of the range and keyframes,\n"
+                                    "from the COLMAP points)")
         self.steps_next = QSpinBox(minimum=500, maximum=200000, singleStep=500, value=5000)
         self.steps_next.setToolTip("Training steps for a warm start (from the previous frame's splats)")
         self.warm = QCheckBox("warm start")
@@ -2211,43 +2333,89 @@ class PreparePanel(QWidget):
                               "and height, … Lower trains faster and needs less GPU memory")
         self.train_btn = QPushButton("Train (Brush)")
         self.train_btn.setStyleSheet("QPushButton:enabled { font-weight:600; }")
-        self.train_btn.setToolTip("Brush on every SfM frame: <scene>/splats/brush/frame_000001.ply …")
+        self.train_btn.setToolTip("Brush on every SfM frame in the range: <scene>/splats/brush/frame_000001.ply …")
         self.train_btn.clicked.connect(self._train)
         self.brush_btn = QPushButton("Brush…")
         self.brush_btn.clicked.connect(lambda: self._brush(choose=True))
         self.brush_btn.setToolTip(self.settings.value("brush", "") or str(BRUSH_DEFAULT))
-        train_row = QHBoxLayout()
-        for w in (QLabel("Steps first"), self.steps_first, QLabel("next"), self.steps_next, self.warm,
-                  self.hold, self.sh, QLabel("max"), self.max_splats, QLabel("resolution"), self.scale,
-                  self.train_btn, self.brush_btn):
-            train_row.addWidget(w)
-        train_row.addStretch()
+        self.pause_btn = QPushButton("Pause")
+        self.pause_btn.setToolTip("Freeze Brush where it is and resume later from the same step.\n"
+                                  "It keeps its GPU memory while paused; Cancel still ends it")
+        self.pause_btn.clicked.connect(lambda: self.brush.pause(not self.brush.paused))
+        self.train_cancel_btn = QPushButton("Cancel")
+        self.train_cancel_btn.setStyleSheet(f"QPushButton:enabled {{ color:{RED}; }}")
+        self.train_cancel_btn.setToolTip("Stop training: finished PLYs stay, the current frame is dropped\n"
+                                         "(Train again with Keep, add missing to carry on)")
+        self.train_cancel_btn.clicked.connect(self.brush.cancel)
 
+        for combo in (self.fmt, self.lens):   # long item texts: don't let them widen the column
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(12)
+
+        def pair(*widgets):
+            row = QHBoxLayout()
+            for w in widgets:
+                row.addWidget(QLabel(w) if isinstance(w, str) else w, 0 if isinstance(w, str) else 1)
+            return row
+
+        def group(title, rows, buttons):
+            g = QGridLayout()
+            for i, (label, w) in enumerate(rows):
+                if label:
+                    g.addWidget(QLabel(label), i, 0)
+                if isinstance(w, QHBoxLayout):
+                    g.addLayout(w, i, 1)
+                else:
+                    g.addWidget(w, i, 1)
+            g.addLayout(pair(*buttons), len(rows), 0, 1, 2)
+            g.setColumnStretch(1, 1)
+            box = QGroupBox(title)
+            box.setLayout(g)
+            return box
+
+        extract_box = group("1 · Extract frames", [("Format", self.fmt), ("FPS", self.extract_fps)],
+                            [self.extract_btn])
+        sfm_box = group("2 · Structure from motion (COLMAP)",
+                        [("Frames from", pair(self.first, "count", self.count)), ("FPS", self.sfm_fps),
+                         ("Reference", self.ref), ("Lens", self.lens),
+                         ("", pair(self.shared, self.undistort))],
+                        [self.sfm_btn, self.colmap_btn])
+        train_box = group("3 · Train splats (Brush)",
+                          [("Frames from", pair(self.train_first, "to", self.train_last)),
+                           ("Cold every", self.keyframe), ("Steps cold", self.steps_first),
+                           ("Steps warm", self.steps_next), ("", pair(self.warm, self.hold)),
+                           ("Detail", self.sh), ("Max splats", self.max_splats), ("Resolution", self.scale)],
+                          # while Brush runs, Pause and Cancel take the place of Train and Brush…
+                          [self.train_btn, self.brush_btn, self.pause_btn, self.train_cancel_btn])
         self.bar = QProgressBar(maximum=1000)
-        note = QLabel("Extract frames turns each scene's videos into <i>&lt;scene&gt;/frames/frame_000001/"
-                      "&lt;camera&gt;.jpg</i> …: one folder per moment with every camera's view of it, for "
-                      "COLMAP. Frames are numbered by their timestamp, so a frame one camera dropped "
-                      "leaves that camera out of one folder instead of shifting all its later frames. "
-                      "Use frame-synced takes: only then does one folder hold one moment.<br>"
-                      "SfM runs COLMAP on the reference frame to find every camera's pose and lens, then "
-                      "triangulates each frame's points with those same cameras, so all frames share one "
-                      "coordinate system: <i>&lt;scene&gt;/point/colmap_0/</i> … (images/ + sparse/0, "
-                      "undistorted) for Gaussian splatting trainers such as SpacetimeGaussians.<br>"
-                      "Train (Brush) trains one splat per SfM frame into <i>&lt;scene&gt;/splats/brush/"
-                      "frame_000001.ply</i> …, each starting from the previous frame's splats.")
-        note.setWordWrap(True)
-        note.setStyleSheet(f"color:{GREY};")
-        title = QLabel("PREPARE  ·  frames for reconstruction")
-        title.setStyleSheet("font-size:16px; font-weight:600;")
+        self.bar.setTextVisible(False)
+        self.bar_text = QLabel()
+        self.bar_text.setWordWrap(True)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setToolTip("Stop frame extraction and SfM (Brush has its own Cancel in Train splats)")
+        self.cancel_btn.clicked.connect(self._cancel)
+        side = QVBoxLayout()
+        for box in (extract_box, sfm_box, train_box):
+            side.addWidget(box)
+        side.addWidget(self.bar)
+        side.addWidget(self.bar_text)
+        side.addWidget(self.cancel_btn)
+        side.addStretch()
+        side_w = QWidget()
+        side_w.setLayout(side)
+        side_w.setFixedWidth(400)
+
+        page = QWidget()
+        page_lay = QHBoxLayout(page)
+        page_lay.addWidget(center, 1)
+        page_lay.addWidget(side_w)
+        splitter = QSplitter()
+        splitter.addWidget(left)
+        splitter.addWidget(page)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([460, 1000])
         lay = QVBoxLayout(self)
-        lay.addWidget(title)
-        lay.addLayout(top)
-        lay.addWidget(note)
-        lay.addWidget(self.table, 1)
-        lay.addLayout(actions)
-        lay.addLayout(sfm_row)
-        lay.addLayout(train_row)
-        lay.addWidget(self.bar)
+        lay.addWidget(splitter)
         self.refresh()
         self._progress()
 
@@ -2268,15 +2436,63 @@ class PreparePanel(QWidget):
             videos = sorted(d.glob("*.mkv"))
             frames = d / "frames"
             n = sum(1 for f in frames.iterdir() if f.name.startswith("frame_")) if frames.is_dir() else 0
-            items = [cell(d.name, str(d)), cell(", ".join(v.stem for v in videos)),
-                     cell(f"{len(videos)}  ({human_bytes(sum(v.stat().st_size for v in videos))})", right=True),
+            items = [cell(d.name, str(d)), cell(str(len(videos)), right=True),
                      cell(str(n) if n else "–", right=True),
                      cell(str(sfm_frames(d)) if sfm_frames(d) else "–", right=True),
                      cell(str(brush_frames(d)) if brush_frames(d) else "–", right=True)]
             for c, item in enumerate(items):
                 self.table.setItem(r, c, item)
         self.table.resizeColumnsToContents()
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._show_scene()
+
+    def _show_scene(self):
+        """The middle column: the first selected scene's videos and stages."""
+        rows = selected_data(self.table)
+        scene = Path(rows[0]) if rows else None
+        if not scene or not scene.is_dir():
+            self.scene_title.setText("select a scene on the left")
+            self.video_table.setRowCount(0)
+            for lab in self.stages.values():
+                lab.setText("–")
+            return
+        self.scene_title.setText(scene.name + (f"   (+{len(rows) - 1} more selected)" if len(rows) > 1 else ""))
+        videos = sorted(scene.glob("*.mkv"))
+        self.video_table.setRowCount(len(videos))
+        for r, v in enumerate(videos):
+            st = v.stat()
+            for c, item in enumerate([cell(v.stem.split("_")[0]), cell(v.name), cell(human_bytes(st.st_size), right=True),
+                                      cell(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)))]):
+                self.video_table.setItem(r, c, item)
+        self.video_table.resizeColumnsToContents()
+        self.video_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+
+        def span(numbers):
+            return f"frame {numbers[0]}" if len(numbers) == 1 else f"frames {numbers[0]}–{numbers[-1]}"
+        f = self.stages
+        frames = scene / "frames"
+        numbers = sorted(int(d.name[6:]) for d in frames.glob("frame_*")) if frames.is_dir() else []
+        f["frames"].setText(f"{len(numbers)} folder(s), {span(numbers)}" if numbers else "–  (extract frames)")
+        sfm = [frame_number(d) for d in sfm_frame_dirs(scene)]
+        f["sfm"].setText(f"{len(sfm)} frame(s), {span(sfm)}" if sfm else "–  (run SfM)")
+        try:
+            ref = json.loads((scene / "point" / "reference.json").read_text())
+            f["ref"].setText(f"{ref['frame']} · {ref['model']}{', shared lens' if ref.get('shared_lens') else ''}"
+                             f"{', undistorted' if ref.get('undistort', True) else ''} · "
+                             f"{len(ref.get('cameras', []))} camera(s) placed")
+        except (OSError, ValueError, KeyError):
+            f["ref"].setText("–")
+        out = scene / "splats" / "brush"
+        plys = sorted(out.glob("frame_*.ply")) if out.is_dir() else []
+        f["ply"].setText(f"{len(plys)} PLY(s), {span([int(p.stem[6:]) for p in plys])} · "
+                         f"{human_bytes(sum(p.stat().st_size for p in plys))}" if plys else "–  (train)")
+        try:
+            o = json.loads((out / "brush.json").read_text())
+            f["brush"].setText(f"frames {o.get('first', 1)}–{o.get('last') or 'end'} · cold every "
+                               f"{o.get('keyframe') or 'never'} · {o['steps_first']}/{o['steps_next']} steps · "
+                               f"SH {o['sh']} · max {o['max_splats'] // 1000} k · 1/{o['downscale']}")
+        except (OSError, ValueError, KeyError):
+            f["brush"].setText("–")
 
     def _extract(self):
         scenes = [Path(p) for p in selected_data(self.table)]
@@ -2380,24 +2596,37 @@ class PreparePanel(QWidget):
             ready = [s for s in ready if s not in distorted]
             if not ready:
                 return
+        first, last = self.train_first.value(), self.train_last.value()
+        span = f"frames {first}-{last or 'end'}"
+        if last and last < first:
+            return self.message.emit(f"Brush: {span} is empty (to is before from)")
+        missing = [s.name for s in ready if not sfm_frame_dirs(s, first, last)]
+        if missing:
+            self.message.emit(f"Brush: no SfM frames in {span} for {', '.join(missing)}")
+        ready = [s for s in ready if s.name not in missing]
+        if not ready:
+            return
         redo = False
-        done = [s.name for s in ready if brush_frames(s)]
+        done = [s.name for s in ready if any(brush_ply(s, d).exists() for d in sfm_frame_dirs(s, first, last))]
         if done:
             redo = keep_or_redo(self, "Train (Brush)",
-                                "These scenes already have trained frames (splats/brush/):\n" + "\n".join(done)
-                                + "\n\nKeep them and train only the missing frames, or start over "
-                                "(every frame again with the current settings)?")
+                                f"These scenes already have trained frames in {span} (splats/brush/):\n"
+                                + "\n".join(done) + "\n\nKeep them and train only the missing frames, or start "
+                                "over (every frame in the range again with the current settings; frames "
+                                "outside the range are kept)?")
             if redo is None:
                 return
-        opts = {"steps_first": self.steps_first.value(), "steps_next": self.steps_next.value(),
+        opts = {"first": first, "last": last, "keyframe": self.keyframe.value(),
+                "steps_first": self.steps_first.value(), "steps_next": self.steps_next.value(),
                 "warm": self.warm.isChecked(), "hold_count": self.hold.isChecked(), "sh": self.sh.currentData(),
                 "max_splats": self.max_splats.value() * 1000, "downscale": self.scale.currentData()}
         n = sum(self.brush.add_scene(s, opts, redo) for s in ready)
-        self.message.emit(f"Brush: training {n} frame(s)" if n else "Brush: nothing to do, every SfM frame has a PLY")
+        self.message.emit(f"Brush: training {n} frame(s), {span}" if n else
+                          f"Brush: nothing to do, every SfM frame in {span} has a PLY")
         self.refresh()
 
     def _cancel(self):
-        for runner in (self.extractor, self.sfm, self.brush):
+        for runner in (self.extractor, self.sfm):
             if runner.busy():
                 runner.cancel()
 
@@ -2412,12 +2641,21 @@ class PreparePanel(QWidget):
         busy = [(name, r) for name, r in (("Extracting", self.extractor), ("SfM", self.sfm),
                                           ("Brush", self.brush)) if r.busy()]
         self.bar.setVisible(bool(busy))
-        self.cancel_btn.setEnabled(bool(busy))
+        self.bar_text.setVisible(bool(busy))
+        self.cancel_btn.setVisible(self.extractor.busy() or self.sfm.busy())
+        training = self.brush.busy()
+        for w in (self.train_btn, self.brush_btn):
+            w.setVisible(not training)
+        for w in (self.pause_btn, self.train_cancel_btn):
+            w.setVisible(training)
+        self.pause_btn.setText("Resume" if self.brush.paused else "Pause")
+        self.pause_btn.setStyleSheet(f"QPushButton:enabled {{ color:{AMBER}; font-weight:600; }}"
+                                     if self.brush.paused else "")
         if busy:
             name, runner = busy[0]
             frac, text = runner.progress()
             self.bar.setValue(int(frac * 1000))
-            self.bar.setFormat(f"{name}: {frac:.0%} · {text}")
+            self.bar_text.setText(f"<b>{name}: {frac:.0%}</b> · {text.lstrip(' ·')}")
 
 
 # ---------------------------------------------------------------- main window
