@@ -29,7 +29,7 @@ import time
 from contextlib import closing
 from pathlib import Path
 
-from PySide6.QtCore import (QObject, QProcess, QProcessEnvironment, QSettings, Qt, QTimer, QUrl,
+from PySide6.QtCore import (QElapsedTimer, QObject, QProcess, QProcessEnvironment, QSettings, Qt, QTimer, QUrl,
                             Signal)
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QPixmap
 from PySide6.QtNetwork import (QAbstractSocket, QNetworkAccessManager, QNetworkReply,
@@ -1959,6 +1959,14 @@ class BrushRunner(QObject):
     Each frame trains in a clean work folder (images/ links, sparse/0, init.ply): pointed at
     colmap_<n> itself, Brush would pick distorted/sparse/0 (on a tie it takes the first path) and
     would take any .ply it finds as the starting splats.
+    Keep order (frozen warm frames): a warm frame keeps the previous frame's splats one for one,
+    same count, same order, so splat i is the same Gaussian in every frame of a group (what a
+    per-pixel codec layout needs). Brush only adds, removes or reorders splats in its refine
+    step (pruning compacts the list, replacements and splits are appended), so frozen frames
+    never refine: --refine-every past the last step. That also skips opacity decay and the
+    screen-size splits, which only run there. The noise Brush adds to faint splats' positions
+    every step is switched off too (--mean-noise-weight 0) so they don't wander. The splat
+    budget is the previous frame's count, so the init.ply is never subsampled.
     Pause freezes every brush-cli where it is (their GPU memory stays allocated) and holds the
     queue; resume carries on with the same frames from the same step."""
     changed = Signal()
@@ -1973,6 +1981,15 @@ class BrushRunner(QObject):
         self.set_gpus([("", "default GPU")])
         self.scenes = {}     # scene -> {"total", "done", "ok", "splats", "bytes", "failed"}
         self.paused = False
+        # Frozen frames print no progress (Brush logs a line per refine only): estimate it from
+        # the time the last frozen frame took, refreshed every second
+        self.frozen_secs = None
+        self.tick = QTimer(self, interval=1000)
+        self.tick.timeout.connect(self._tick)
+
+    def _tick(self):
+        if any(s["job"] and s["job"].get("frozen") for s in self.slots) and not self.paused:
+            self.changed.emit()
 
     def set_gpus(self, gpus):
         """One slot per (CUBECL_WGPU_DEFAULT_DEVICE value, label); "" = Brush's own choice. Only
@@ -2054,8 +2071,16 @@ class BrushRunner(QObject):
         for slot in self.slots:
             j = slot["job"]
             if j:
-                done += min(j["iter"] / j["steps"], 1)
                 gpu = f"{slot['label']}: " if len(self.slots) > 1 else ""
+                if j.get("frozen"):
+                    secs = j["clock"].elapsed() / 1000
+                    frac = min(secs / self.frozen_secs, 0.99) if self.frozen_secs else 0
+                    done += frac
+                    eta = f", ~{max(0, self.frozen_secs - secs):.0f} s left" if self.frozen_secs else ""
+                    now.append(f"{gpu}{j['scene'].name}/{j['ply'].stem} frozen warm {j['steps']} steps, "
+                               f"{j['splats']:,} splats · {secs:.0f} s{eta}")
+                    continue
+                done += min(j["iter"] / j["steps"], 1)
                 now.append(f"{gpu}{j['scene'].name}/{j['ply'].stem} {'warm' if j['warm'] else 'cold'} "
                            f"{j['iter']}/{j['steps']} steps, {j['splats']:,} splats")
         left = sum(len(g) for g in self.queue) + sum(len(s["group"]) + bool(s["job"]) for s in self.slots)
@@ -2095,13 +2120,19 @@ class BrushRunner(QObject):
         work = job["work"] = out / f".work_{job['ply'].stem}"
         prev = job["prev"]
         job["warm"] = bool(opts["warm"] and prev and prev.exists())
+        job["frozen"] = job["warm"] and opts.get("freeze", False)
         job["steps"] = opts["steps_next"] if job["warm"] else opts["steps_first"]
         job["iter"], job["splats"] = 0, 0
         # A warm frame keeps the previous frame's splat budget: Brush relocates splats at the cap
         # instead of adding them, so every PLY stays the size of the first (a steady data rate).
         # Uncapped, each warm frame grew ~1.5x on the last until max-splats.
         max_splats = opts["max_splats"]
-        if job["warm"] and opts.get("hold_count", True):
+        if job["frozen"]:   # exactly the previous frame's splats: never subsampled, never grown
+            try:
+                max_splats = job["splats"] = ply_splats(prev)
+            except OSError as e:
+                return self._failed(slot, f"previous frame: {e}")
+        elif job["warm"] and opts.get("hold_count", True):
             try:
                 max_splats = max(1000, min(max_splats, ply_splats(prev)))
             except OSError:
@@ -2129,14 +2160,18 @@ class BrushRunner(QObject):
             env.insert("CUBECL_WGPU_DEFAULT_DEVICE", slot["gpu"])
         proc.setProcessEnvironment(env)
         proc.setProgram(self.program)
+        # growth stops halfway, as Brush's default does for its 30000 steps; frozen: no refine at all
+        refine = (["--refine-every", str(steps + 1), "--growth-stop-iter", "0", "--mean-noise-weight", "0"]
+                  if job["frozen"] else ["--growth-stop-iter", str(steps // 2)])
         proc.setArguments([
-            str(work), self.flavor["steps"], str(steps),
-            # growth stops halfway, as Brush's default does for its 30000 steps
-            "--growth-stop-iter", str(steps // 2),
+            str(work), self.flavor["steps"], str(steps), *refine,
             "--max-splats", str(max_splats), "--sh-degree", str(opts["sh"]),
             "--max-resolution", str(max_res),
             "--export-every", str(steps), "--export-path", str(work / "export"),
             "--export-name", "result.ply"])
+        job["clock"] = QElapsedTimer()
+        job["clock"].start()
+        self.tick.start()
         proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         job["log"] = []
         proc.readyReadStandardOutput.connect(lambda s=slot, p=proc: self._read(s, p))
@@ -2175,6 +2210,11 @@ class BrushRunner(QObject):
             lines = [line for line in log.splitlines() if line.strip()]
             return self._failed(slot, "brush-cli not found or won't start (choose it with Brush…)" if code == -1
                                 else lines[-1][-200:] if lines else f"exit {code}, no PLY written")
+        if job["frozen"] and ply_splats(result) != job["splats"]:
+            return self._failed(slot, f"frozen frame changed the splat count ({job['splats']:,} -> "
+                                      f"{ply_splats(result):,}): this Brush build refines anyway")
+        if job["frozen"]:
+            self.frozen_secs = job["clock"].elapsed() / 1000
         os.replace(result, job["ply"])
         shutil.rmtree(job["work"], ignore_errors=True)
         s = self.scenes[job["scene"]]
@@ -2201,6 +2241,8 @@ class BrushRunner(QObject):
                 + (f" · FAILED {'; '.join(failed[:3])}" + (f" (+{len(failed) - 3} more)" if len(failed) > 3
                                                           else "") if failed else ""))
         slot["job"] = None
+        if not any(sl["job"] for sl in self.slots):
+            self.tick.stop()
         QTimer.singleShot(0, self._next)   # not recursive: a run of failing frames
 
 
@@ -2369,6 +2411,13 @@ class PreparePanel(QWidget):
         self.warm.setChecked(True)
         self.warm.setToolTip("Start each frame from the previous frame's trained splats: faster and\n"
                              "steadier between frames. Off: every frame from its own COLMAP points.")
+        self.freeze = QCheckBox("keep order (frozen warm frames)")
+        self.freeze.setToolTip("Warm frames keep the previous frame's splats one for one: same count, same\n"
+                               "order, so splat i is the same Gaussian through the whole group (cold start to\n"
+                               "cold start), for codec-style compression. Brush doesn't refine those frames\n"
+                               "(no pruning, growing, splitting or relocating): splats can only move and change.\n"
+                               "New things appearing need a cold start (Cold every)")
+        self.freeze.toggled.connect(lambda on: self.hold.setEnabled(not on))
         self.hold = QCheckBox("hold count")
         self.hold.setChecked(True)
         self.hold.setToolTip("Warm frames keep the previous frame's splat count (Brush relocates splats\n"
@@ -2454,7 +2503,7 @@ class PreparePanel(QWidget):
         train_box = group("3 · Train splats (Brush)",
                           [("Frames from", pair(self.train_first, "to", self.train_last)),
                            ("Cold every", self.keyframe), ("Steps cold", self.steps_first),
-                           ("Steps warm", self.steps_next), ("", pair(self.warm, self.hold)),
+                           ("Steps warm", self.steps_next), ("", pair(self.warm, self.hold)), ("", self.freeze),
                            ("Detail", self.sh), ("Max splats", self.max_splats), ("Resolution", self.scale),
                            ("GPU", self.gpu), ("2nd GPU", self.gpu2)],
                           # while Brush runs, Pause and Cancel take the place of Train and Brush…
@@ -2562,7 +2611,8 @@ class PreparePanel(QWidget):
             o = json.loads((out / "brush.json").read_text())
             f["brush"].setText(f"frames {o.get('first', 1)}–{o.get('last') or 'end'} · cold every "
                                f"{o.get('keyframe') or 'never'} · {o['steps_first']}/{o['steps_next']} steps · "
-                               f"SH {o['sh']} · max {o['max_splats'] // 1000} k · 1/{o['downscale']}")
+                               f"SH {o['sh']} · max {o['max_splats'] // 1000} k · 1/{o['downscale']}"
+                               + (" · keep order" if o.get("freeze") else ""))
         except (OSError, ValueError, KeyError):
             f["brush"].setText("–")
 
@@ -2690,7 +2740,8 @@ class PreparePanel(QWidget):
                 return
         opts = {"first": first, "last": last, "keyframe": self.keyframe.value(),
                 "steps_first": self.steps_first.value(), "steps_next": self.steps_next.value(),
-                "warm": self.warm.isChecked(), "hold_count": self.hold.isChecked(), "sh": self.sh.currentData(),
+                "warm": self.warm.isChecked(), "hold_count": self.hold.isChecked(), "freeze": self.freeze.isChecked(),
+                "sh": self.sh.currentData(),
                 "max_splats": self.max_splats.value() * 1000, "downscale": self.scale.currentData()}
         gpus = [(self.gpu.currentData() or "", self.gpu.currentText())]
         if self.gpu2.currentData() is not None:
@@ -2711,8 +2762,13 @@ class PreparePanel(QWidget):
         if os.name != "nt":
             return
         proc = QProcess(self)
-        proc.finished.connect(lambda *_: self._fill_gpus(
-            bytes(proc.readAllStandardOutput()).decode(errors="replace").splitlines()))
+
+        def done(*_):
+            try:
+                self._fill_gpus(bytes(proc.readAllStandardOutput()).decode(errors="replace").splitlines())
+            except RuntimeError:   # the window closed before PowerShell answered
+                pass
+        proc.finished.connect(done)
         proc.start("powershell", ["-NoProfile", "-Command", "(Get-CimInstance Win32_VideoController).Name"])
 
     def _fill_gpus(self, names):

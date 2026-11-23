@@ -1,0 +1,5 @@
+# Third-party tools (Brush, COLMAP, SuperSplat): built or downloaded locally
+External/
+
+# Recordings, extracted frames, SfM and splat output
+captures/
