@@ -30,6 +30,12 @@ Rules learned on the rig (see SESSION_NOTES_2026-11-03/04.md):
   - rkaiq sets the frame rate from the IQ file (AecFrameRateMode.FpsValue), and sometimes
     ignores it; the daemon measures the real rate and restarts the chain if it is wrong
   - rkaiq reads the IQ file only at start, so a preset change restarts the chain
+  - shutter (setting shutter_us, 0 = auto) also goes in through the IQ file: AE in manual mode
+    with only the exposure time fixed; gain stays automatic, so the brightness still adapts.
+    Longest shutter = one frame period (less the sensor's 22-line margin)
+  - temporal noise reduction (bayertnr) blends each frame with earlier ones where it sees no
+    motion; at high gain noise hides the motion and moving things go see-through (ghosting, in
+    the ISP output itself, keyframes included). Setting tnr: preset | low (half strength) | off
   - v4l2src picks the 2-plane NM12 format when offered, which the MPP encoder can only CPU-copy;
     the service preloads hide_nm12.so so it picks 1-plane NV12 and the encoder imports the ISP
     buffer directly (zero-copy: UHD60 with 0 drops instead of 3-4/s)
@@ -73,7 +79,7 @@ gi.require_version("Gst", "1.0")
 gi.require_version("GstAllocators", "1.0")
 from gi.repository import Gst, GstAllocators  # noqa: E402
 
-VERSION = "0.3.4"
+VERSION = "0.3.6"
 CONTROL_PORT = 7070
 HTTP_PORT = 8080
 # Who this camera is: {"ip": ...}, applied to the network by camrig-net (root, at boot and
@@ -127,7 +133,13 @@ MODES = {
 # 16 x 18.4 MB (full45) ~ 295 MB of normal RAM (ISP buffers go through the IOMMU, not CMA).
 POOL_BUFFERS = 14
 DEFAULTS = {"mode": "uhd60", "preset": "day", "preview": True, "preview_fps": 5,
-            "bitrate_mbps": 60, "sync": "off", "rec_buffer": "direct"}
+            "bitrate_mbps": 60, "sync": "off", "rec_buffer": "direct", "shutter_us": 0,
+            "tnr": "preset"}
+TNR_MODES = {"preset": 1.0, "low": 0.5, "off": 0.0}   # scale on bayertnr filter strength
+V4L2_CID_ANALOGUE_GAIN = 0x009e0903
+GAIN_UNIT = 16          # rockchip imx477 driver: analogue_gain 16 = 1x (IQ GainDot max 352 = 5632)
+SHUTTER_MIN_US = 20
+SHUTTER_FRAME_SHARE = 0.97   # longest shutter = this share of the frame period (22-line margin)
 SYNC_ROLES = ("off", "master", "follower")
 
 log = logging.getLogger("camd")
@@ -318,14 +330,49 @@ def presets():
                   if (m := re.fullmatch(rf"{IQ_NAME}\.(.+)\.json", p.name)))
 
 
-def write_active_iq(preset, iq_fps):
-    """Copy preset -> the active IQ file rkaiq reads, with this mode's frame rate.
+def max_shutter_us(mode):
+    return int(1e6 / MODES[mode]["fps"] * SHUTTER_FRAME_SHARE)
+
+
+def check_shutter(us):
+    """0 = auto exposure, else a fixed exposure time in us (the mode's limit is applied at start)."""
+    us, top = int(us), max(max_shutter_us(m) for m in MODES)
+    if us and not SHUTTER_MIN_US <= us <= top:
+        raise ValueError(f"shutter must be 0 (auto) or {SHUTTER_MIN_US}-{top} us")
+    return us
+
+
+def write_active_iq(preset, iq_fps, shutter_s=0, tnr="preset"):
+    """Copy preset -> the active IQ file rkaiq reads, with this mode's frame rate and, with
+    shutter_s, a fixed exposure time (AE manual for the time only: gain stays automatic).
+    tnr scales (low) or switches off (off) the temporal noise reduction at every ISO.
     The presets themselves are never modified."""
     data = json.loads((IQ_DIR / f"{IQ_NAME}.{preset}.json").read_text())
-    found = []
+    found, shutters, tnrs = [], [], []
+
+    def set_tnr(node):
+        tuning = node.get("TuningPara")
+        if not isinstance(tuning, dict):
+            return
+        if tnr == "off":
+            tuning["enable"] = 0
+        for s in tuning.get("Setting", []):
+            for iso in s.get("Tuning_ISO", []):
+                for k in ("lo_filter_strength", "hi_filter_strength"):
+                    if k in iso:
+                        iso[k] = round(iso[k] * TNR_MODES[tnr], 3)
+        tnrs.append(node)
 
     def walk(node):
         if isinstance(node, dict):
+            if tnr != "preset" and isinstance(node.get("bayertnr_v2"), dict):
+                set_tnr(node["bayertnr_v2"])
+            if shutter_s and "AecOpType" in node:
+                lin = (node.get("AecManualCtrl") or {}).get("LinearAE")
+                if isinstance(lin, dict):
+                    node["AecOpType"] = "RK_AIQ_OP_MODE_MANUAL"
+                    lin.update(ManualTimeEn=1, TimeValue=shutter_s, ManualGainEn=0, ManualIspDgainEn=0)
+                    shutters.append(lin)
             for k, v in node.items():
                 if k == "AecFrameRateMode" and isinstance(v, dict):
                     v["isFpsFix"], v["FpsValue"] = 1, iq_fps
@@ -338,6 +385,10 @@ def write_active_iq(preset, iq_fps):
     walk(data)
     if not found:
         raise RuntimeError(f"preset {preset}: no AecFrameRateMode in IQ file")
+    if shutter_s and not shutters:
+        raise RuntimeError(f"preset {preset}: no AecManualCtrl.LinearAE in IQ file (fixed shutter)")
+    if tnr != "preset" and not tnrs:
+        raise RuntimeError(f"preset {preset}: no bayertnr_v2 in IQ file (tnr {tnr})")
     tmp = IQ_DIR / f".{IQ_NAME}.json.tmp"
     tmp.write_text(json.dumps(data, indent="\t"))
     os.replace(tmp, IQ_DIR / f"{IQ_NAME}.json")
@@ -401,6 +452,7 @@ class Camera:
         self.pstats = None
         self.rec = None
         self.sync = None   # camsync.SyncService while active with a sync role
+        self.sensor_fd = None  # sensor subdev while active: reads back the exposure rkaiq set
         self.base = 0      # pipeline base time: buffer pts + base = CLOCK_MONOTONIC of the frame
         self.jpeg = None
         self.jpeg_seq = 0
@@ -448,6 +500,7 @@ class Camera:
                        "frames": self.stats.frames, "dropped": self.stats.dropped,
                        "buffers": len(self.stats.buffers),
                        "size": m["out"]} if self.stats and m else None,
+            "exposure": self._exposure(),
             "preview": {"running": self.preview is not None,
                         "fps": round(self.pstats.fps(), 1) if self.pstats else 0,
                         "size": m["preview"] if m else None},
@@ -461,28 +514,49 @@ class Camera:
             "ram": {"saving": self.saving, "queued": self.save_queue.qsize()},
         }
 
+    def _exposure(self):
+        """The sensor's exposure time (us) and analogue gain right now, set by AE or the fixed shutter."""
+        if not self.sensor_fd or not self.mode:
+            return None
+        try:
+            fd = self.sensor_fd.fileno()
+            lines = camsync.get_ctrl(fd, camsync.V4L2_CID_EXPOSURE)
+            vblank = camsync.get_ctrl(fd, camsync.V4L2_CID_VBLANK)
+            gain = camsync.get_ctrl(fd, V4L2_CID_ANALOGUE_GAIN)
+        except OSError:
+            return None
+        m = MODES[self.mode]
+        line_us = 1e6 / m["fps"] / (m["sensor"][1] + vblank)
+        return {"us": round(lines * line_us), "lines": lines, "fixed": bool(self.settings["shutter_us"]),
+                "gain": round(gain / GAIN_UNIT, 2)}
+
     def changed(self):
         for cb in list(self.listeners):
             cb()
 
     # -- bring-up / tear-down
 
-    async def start(self, mode=None, preset=None, preview=None):
+    async def start(self, mode=None, preset=None, preview=None, shutter_us=None, tnr=None):
         async with self.lock:
             mode = mode or self.settings["mode"]
             preset = preset or self.settings["preset"]
+            shutter = self.settings["shutter_us"] if shutter_us is None else check_shutter(shutter_us)
+            tnr = tnr or self.settings["tnr"]
+            if tnr not in TNR_MODES:
+                raise ValueError(f"tnr must be one of {', '.join(TNR_MODES)}")
             if mode not in MODES:
                 raise ValueError(f"unknown mode {mode}; modes: {', '.join(MODES)}")
             if preset not in presets():
                 raise ValueError(f"unknown preset {preset}; presets: {', '.join(presets())}")
             if preview is not None:
                 self.settings["preview"] = bool(preview)
-            if self.state == "active" and self.mode == mode and self.settings["preset"] == preset:
+            if self.state == "active" and self.mode == mode and self.settings["preset"] == preset \
+                    and self.settings["shutter_us"] == shutter and self.settings["tnr"] == tnr:
                 await self._sync_preview()
                 return self.status()
             if self.rec:
-                raise RuntimeError("stop recording before changing mode or preset")
-            self.settings.update(mode=mode, preset=preset)
+                raise RuntimeError("stop recording before changing mode, preset, shutter or tnr")
+            self.settings.update(mode=mode, preset=preset, shutter_us=shutter, tnr=tnr)
             self.save_settings()
             await self._tear_down()
             await self._bring_up(mode)
@@ -531,7 +605,12 @@ class Camera:
         # Anything left from the old scripts would hold the devices
         await run("pkill", "-x", "gst-launch-1.0")
         await run("pkill", "-x", "rkaiq_3A_server")
-        write_active_iq(self.settings["preset"], m["iq_fps"])
+        shutter = self.settings["shutter_us"]
+        if shutter > max_shutter_us(mode):
+            shutter = max_shutter_us(mode)
+            self.warnings.append(f"shutter {self.settings['shutter_us']} us is longer than a "
+                                 f"{mode} frame, using {shutter} us")
+        write_active_iq(self.settings["preset"], m["iq_fps"], shutter / 1e6, self.settings["tnr"])
         sw, sh = m["sensor"]
         # The sensor's media entity lives in rkcif's media graph; find which /dev/media*
         for media in sorted(Path("/dev").glob("media*")):
@@ -547,6 +626,7 @@ class Camera:
         await asyncio.sleep(3)  # rkaiq opens the sensor and loads the IQ file
         if self.aiq.returncode is not None:
             raise RuntimeError(f"rkaiq_3A_server exited ({self.aiq.returncode}), see {AIQ_LOG}")
+        self.sensor_fd = open(sensor, "rb", buffering=0)
 
         w, h = m["out"]
         self.main = Gst.parse_launch(
@@ -605,6 +685,9 @@ class Camera:
                 self.aiq.kill()
                 await self.aiq.wait()
         self.aiq = None
+        if self.sensor_fd:
+            self.sensor_fd.close()
+            self.sensor_fd = None
 
     async def _tear_down(self):
         if self.state in ("idle",) and not self.main:
@@ -832,9 +915,13 @@ class Camera:
                 rec["spill"] = Spill(path)
                 rec["drainer"] = asyncio.create_task(self._drainer(rec["spill"]))
             self.rec = rec
-            log.info("recording %s at %d Mbit/s%s%s", path.name, bps // 1_000_000,
+            ex = self._exposure() or {}
+            log.info("recording %s at %d Mbit/s%s%s; preset %s, shutter %s, exposure %s us, gain %sx, tnr %s",
+                     path.name, bps // 1_000_000,
                      " (synced start)" if start_local is not None else "",
-                     " into RAM" if rec_dir == RAM_DIR else "")
+                     " into RAM" if rec_dir == RAM_DIR else "",
+                     self.settings["preset"], self.settings["shutter_us"] or "auto",
+                     ex.get("us"), ex.get("gain"), self.settings["tnr"])
             self.changed()
             return self.status()
 
@@ -1100,6 +1187,27 @@ class Camera:
         self.changed()
         return self.status()
 
+    def set_shutter(self, us):
+        """Active: start() restarts the chain (rkaiq reads the IQ file only at start).
+        Otherwise saved for the next start."""
+        if self.state == "active":
+            return self.start(shutter_us=us)
+        self.settings["shutter_us"] = check_shutter(us)
+        self.save_settings()
+        self.changed()
+        return self.status()
+
+    def set_tnr(self, tnr):
+        """Same as set_shutter: restarts an active chain, else saved for the next start."""
+        if tnr not in TNR_MODES:
+            raise ValueError(f"tnr must be one of {', '.join(TNR_MODES)}")
+        if self.state == "active":
+            return self.start(tnr=tnr)
+        self.settings["tnr"] = tnr
+        self.save_settings()
+        self.changed()
+        return self.status()
+
     def _later(self, coro_fn):
         """Run after the reply has gone out (the connection may not survive the action)."""
         async def go():
@@ -1164,8 +1272,11 @@ class ControlServer:
         self.commands = {
             "hello": lambda a: cam.ident,
             "status": lambda a: cam.status(),
-            "get_config": lambda a: {"modes": MODES, "presets": presets(), "settings": cam.settings},
-            "start": lambda a: cam.start(a.get("mode"), a.get("preset"), a.get("preview")),
+            "get_config": lambda a: {"modes": MODES, "presets": presets(), "settings": cam.settings,
+                                     "shutter_max_us": {m: max_shutter_us(m) for m in MODES},
+                                     "tnr_modes": list(TNR_MODES)},
+            "start": lambda a: cam.start(a.get("mode"), a.get("preset"), a.get("preview"),
+                                         a.get("shutter_us"), a.get("tnr")),
             "stop": lambda a: cam.stop(),
             "set_preset": lambda a: cam.start(preset=a["preset"]) if cam.state == "active"
             else self._set_setting("preset", a["preset"], presets()),
@@ -1173,6 +1284,8 @@ class ControlServer:
             else self._set_setting("mode", a["mode"], MODES),
             "set_preview": lambda a: cam.set_preview(a["enabled"]),
             "set_bitrate": lambda a: cam.set_bitrate(a["mbps"]),
+            "set_shutter": lambda a: cam.set_shutter(a["us"]),
+            "set_tnr": lambda a: cam.set_tnr(a["tnr"]),
             "set_rec_buffer": lambda a: self._set_setting("rec_buffer", a["buffer"], REC_BUFFERS),
             "record_start": lambda a: cam.record_start(a.get("bitrate_mbps"), a.get("take"), a.get("at_ts")),
             "record_stop": lambda a: cam.record_stop(a.get("at_ts")),

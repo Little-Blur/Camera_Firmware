@@ -71,10 +71,12 @@ and stops after the same frame, so all files of a scene have the same frames.
 | `hello` | | camera_id (`NEW` if unconfigured), configured, ip, configured_ip, hostname, mac, serial, version |
 | `status` | | state idle/starting/active/stopping/error, fps, drops, recording, temps, disk |
 | `get_config` | | modes, IQ presets, saved settings |
-| `start` | `mode`, `preset`, `preview` (all optional) | ~6 s: rkaiq, mainpath, frame-rate check |
+| `start` | `mode`, `preset`, `preview`, `shutter_us`, `tnr` (all optional) | ~6 s: rkaiq, mainpath, frame-rate check |
 | `stop` | | finishes a recording first |
 | `set_mode` / `set_preset` | `mode` / `preset` | restarts the chain if active (rkaiq reads IQ only at start); refused while recording |
 | `set_preview` | `enabled` | live, no restart |
+| `set_tnr` | `tnr` = `preset` / `low` / `off` | ISP temporal noise reduction (bayertnr): `low` halves its strength at every ISO, `off` disables it. At high gain it makes moving things see-through (ghosting). Restarts the chain if active; refused while recording |
+| `set_shutter` | `us` (0 = auto) | fixed exposure time in µs; gain stays automatic. Restarts the chain if active (written into the IQ file); refused while recording. Capped at one frame (uhd60 16166 µs, full45 21555 µs). Status `exposure.us` / `exposure.gain` = what the sensor actually runs |
 | `set_bitrate` | `mbps` | used by the next recording |
 | `set_rec_buffer` | `buffer` = `direct` / `ram` | `ram`: record into RAM instead of letting the page cache flush to the NVMe in bursts (bursts make the left ISP core late/freeze); every 1.5 GB the take is moved to the NVMe in one steady paced run and freed from RAM while recording continues, the rest after the take. Length limited by NVMe space. Status `recording.ram_mb` / `moves` / `seconds_left`, `ram.saving`; `list_recordings` marks unsaved files `in_ram` (not downloadable until saved) |
 | `record_start` | `bitrate_mbps`, `take`, `at_ts` (optional) | H.265 MKV in `~/rec`; `take` = shared file name for a rig scene; `at_ts` = first frame, on the sync master's clock |

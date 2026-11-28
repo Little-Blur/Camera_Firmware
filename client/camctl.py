@@ -51,6 +51,19 @@ STATE_COLORS = {"active": "#2e9d4f", "starting": "#d49a1a", "stopping": "#d49a1a
 GREEN, RED, AMBER, GREY = "#2e9d4f", "#c8372d", "#d49a1a", "#777777"
 
 
+# Shutter choices (us; 0 = auto exposure). The camera caps a shutter longer than its mode's frame.
+SHUTTERS = [0, 20000, 16666, 10000, 8333, 4000, 2000, 1000, 500, 250, 125]
+
+
+TNR_MODES = [("preset", "Preset"), ("low", "Low (half)"), ("off", "Off")]
+
+
+def shutter_text(us):
+    if not us:
+        return "Auto"
+    return f"1/{round(1e6 / us)} s" if us <= 500_000 else f"{us / 1e6:g} s"
+
+
 def human_bytes(n):
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1000:
@@ -451,13 +464,25 @@ def ask_folder(parent, key, title):
 
 
 class CaptureControls(QGroupBox):
-    """Mode / preset / bitrate / preview + start and record buttons. Used by a camera page and
-    by the RIG page; the page decides where the commands go."""
+    """Mode / preset / shutter / TNR / bitrate / preview + start and record buttons. Used by a camera
+    page and by the RIG page; the page decides where the commands go."""
 
     def __init__(self, title):
         super().__init__(title)
         self.mode = QComboBox()
         self.preset = QComboBox()
+        self.shutter = QComboBox()
+        for us in SHUTTERS:
+            self.shutter.addItem(shutter_text(us), us)
+        self.shutter.setToolTip("Exposure time. Auto: the preset's auto exposure.\n"
+                                "Fixed: only the time is fixed, gain still adapts to the light.\n"
+                                "Changing it restarts a running camera (~6 s).")
+        self.tnr = QComboBox()
+        for key, label in TNR_MODES:
+            self.tnr.addItem(label, key)
+        self.tnr.setToolTip("Temporal noise reduction in the ISP: blends each frame with earlier ones.\n"
+                            "Less noise, but at high gain moving things go see-through (ghosting).\n"
+                            "Changing it restarts a running camera (~6 s).")
         self.preview_box = QCheckBox("Preview")
         self.bitrate = QSpinBox(suffix=" Mbit/s", minimum=5, maximum=200, singleStep=5, value=60)
         self.start_btn = QPushButton("Start camera")
@@ -468,11 +493,15 @@ class CaptureControls(QGroupBox):
         grid.addWidget(self.mode, 0, 1)
         grid.addWidget(QLabel("Preset"), 1, 0)
         grid.addWidget(self.preset, 1, 1)
-        grid.addWidget(QLabel("Bitrate"), 2, 0)
-        grid.addWidget(self.bitrate, 2, 1)
-        grid.addWidget(self.preview_box, 3, 1)
-        grid.addWidget(self.start_btn, 4, 0, 1, 2)
-        grid.addWidget(self.rec_btn, 5, 0, 1, 2)
+        grid.addWidget(QLabel("Shutter"), 2, 0)
+        grid.addWidget(self.shutter, 2, 1)
+        grid.addWidget(QLabel("TNR"), 3, 0)
+        grid.addWidget(self.tnr, 3, 1)
+        grid.addWidget(QLabel("Bitrate"), 4, 0)
+        grid.addWidget(self.bitrate, 4, 1)
+        grid.addWidget(self.preview_box, 5, 1)
+        grid.addWidget(self.start_btn, 6, 0, 1, 2)
+        grid.addWidget(self.rec_btn, 7, 0, 1, 2)
 
     def fill(self, cfg):
         """Modes and presets from a camera's get_config (all cameras run the same firmware)."""
@@ -482,8 +511,11 @@ class CaptureControls(QGroupBox):
             self.mode.addItem(f"{key}  ({m['label']})", key)
         self.preset.addItems(cfg["presets"])
 
-    def select(self, mode=None, preset=None, preview=None, bitrate=None):
-        for combo, value in ((self.mode, mode), (self.preset, preset)):
+    def select(self, mode=None, preset=None, preview=None, bitrate=None, shutter=None, tnr=None):
+        if shutter is not None and self.shutter.findData(shutter) < 0:  # set elsewhere (camcli)
+            self.shutter.addItem(shutter_text(shutter), shutter)
+        for combo, value in ((self.mode, mode), (self.preset, preset), (self.shutter, shutter),
+                             (self.tnr, tnr)):
             if value is None:
                 continue
             i = combo.findData(value) if combo.findData(value) >= 0 else combo.findText(value)
@@ -498,7 +530,8 @@ class CaptureControls(QGroupBox):
 
     def target(self):
         return {"mode": self.mode.currentData(), "preset": self.preset.currentText(),
-                "preview": self.preview_box.isChecked(), "bitrate": self.bitrate.value()}
+                "preview": self.preview_box.isChecked(), "bitrate": self.bitrate.value(),
+                "shutter": self.shutter.currentData(), "tnr": self.tnr.currentData()}
 
 
 class VideoTable(QWidget):
@@ -582,6 +615,12 @@ class CameraPanel(QWidget):
         self.controls = c = CaptureControls("Camera")
         c.mode.activated.connect(lambda: self.link.send("set_mode", mode=c.mode.currentData()))
         c.preset.activated.connect(lambda: self.link.send("set_preset", preset=c.preset.currentText()))
+        c.shutter.activated.connect(lambda: self.link.send(
+            "set_shutter", lambda ok, r: ok or self.message.emit(f"{self.link.name}: {r}"),
+            us=c.shutter.currentData()))
+        c.tnr.activated.connect(lambda: self.link.send(
+            "set_tnr", lambda ok, r: ok or self.message.emit(f"{self.link.name}: {r}"),
+            tnr=c.tnr.currentData()))
         c.preview_box.clicked.connect(lambda on: self.link.send("set_preview", enabled=on))
         c.bitrate.editingFinished.connect(lambda: self.link.send("set_bitrate", mbps=c.bitrate.value()))
         c.start_btn.clicked.connect(self._start_stop)
@@ -589,7 +628,7 @@ class CameraPanel(QWidget):
 
         self.fields = {}
         grid = QGridLayout()
-        for i, (key, label) in enumerate([("state", "State"), ("stream", "Stream"),
+        for i, (key, label) in enumerate([("state", "State"), ("stream", "Stream"), ("exposure", "Exposure"),
                                           ("drops", "Capture drops"), ("rec", "Recording"),
                                           ("recdrops", "Rec drops"), ("sync", "Frame sync"),
                                           ("temp", "SoC temp"),
@@ -704,6 +743,10 @@ class CameraPanel(QWidget):
         f["stream"].setText(f"{st['fps']:.2f} / {st['target_fps']} fps  ·  {st['size'][0]}×{st['size'][1]}"
                             if st else "–")
         f["drops"].setText(f"{st['dropped']} of {st['frames']}" if st else "–")
+        ex = s.get("exposure")
+        f["exposure"].setText(f"{shutter_text(ex['us'])}  ({ex['us']} µs, {'fixed' if ex['fixed'] else 'auto'})"
+                              + (f"  ·  gain {ex['gain']:g}×" if ex.get("gain") is not None else "")
+                              if ex and ex["us"] else "–")
         rec = s.get("recording")
         f["rec"].setText(f"<b style='color:#c8372d'>● {mmss(rec['seconds'])}</b>  {human_bytes(rec['bytes'])}"
                          f"<br><small>{rec['file']}</small>" if rec else "–")
@@ -720,7 +763,8 @@ class CameraPanel(QWidget):
         settings = s.get("settings", {})
         if settings:
             c.select(mode=s.get("mode") or settings.get("mode"), preset=settings.get("preset"),
-                     preview=settings.get("preview", False), bitrate=settings.get("bitrate_mbps"))
+                     preview=settings.get("preview", False), bitrate=settings.get("bitrate_mbps"),
+                     shutter=settings.get("shutter_us"), tnr=settings.get("tnr"))
 
         online = self.state != "offline"
         running = self.state in ("active", "starting")
@@ -728,7 +772,7 @@ class CameraPanel(QWidget):
         c.start_btn.setEnabled(online and not busy)
         c.rec_btn.setEnabled(self.state == "active" and not busy)
         c.rec_btn.setText("■ Stop recording" if rec else "● Record")
-        for w in (c.mode, c.preset, c.preview_box, c.bitrate):
+        for w in (c.mode, c.preset, c.shutter, c.tnr, c.preview_box, c.bitrate):
             w.setEnabled(online and not busy and not rec)
         if (rec is None) != (self.was_recording is None):  # a recording started or finished
             self.refresh_recordings()
@@ -741,7 +785,8 @@ class CameraPanel(QWidget):
             self.link.send("stop")
         else:
             t = self.controls.target()
-            self.link.send("start", mode=t["mode"], preset=t["preset"], preview=t["preview"])
+            self.link.send("start", mode=t["mode"], preset=t["preset"], preview=t["preview"],
+                           shutter_us=t["shutter"], tnr=t["tnr"])
 
     def _record(self):
         if self.link.last.get("recording"):
@@ -876,15 +921,18 @@ class RigPanel(QWidget):
         saved = json.loads(self.settings.value("rig_target", "{}") or "{}")
         c.preview_box.setChecked(saved.get("preview", True))
         c.bitrate.setValue(saved.get("bitrate", 60))
+        c.select(shutter=saved.get("shutter", 0), tnr=saved.get("tnr", "preset"))
         self._saved = saved
         c.mode.activated.connect(lambda: self._apply("set_mode", mode=c.mode.currentData()))
         c.preset.activated.connect(lambda: self._apply("set_preset", preset=c.preset.currentText()))
+        c.shutter.activated.connect(lambda: self._apply("set_shutter", us=c.shutter.currentData()))
+        c.tnr.activated.connect(lambda: self._apply("set_tnr", tnr=c.tnr.currentData()))
         c.preview_box.clicked.connect(lambda on: self._apply("set_preview", enabled=on))
         c.bitrate.editingFinished.connect(lambda: self._apply("set_bitrate", mbps=c.bitrate.value()))
         c.start_btn.clicked.connect(self._start_stop)
         c.rec_btn.clicked.connect(self._record)
         sync_btn = QPushButton("Push settings to all")
-        sync_btn.setToolTip("Send mode, preset, bitrate and preview to every camera that doesn't match")
+        sync_btn.setToolTip("Send mode, preset, shutter, TNR, bitrate and preview to every camera that doesn't match")
         sync_btn.clicked.connect(self._push_all)
 
         # Frame sync: one master, everyone else follows it (camsync on the cameras)
@@ -970,6 +1018,7 @@ class RigPanel(QWidget):
             return AMBER, "applying…"
         st, t = s.get("settings", {}), {**self.target(), "sync": self.expected_role(link)}
         diffs = [k for k, have in (("mode", s.get("mode") or st.get("mode")), ("preset", st.get("preset")),
+                                   ("shutter", st.get("shutter_us")), ("tnr", st.get("tnr")),
                                    ("preview", st.get("preview")), ("bitrate", st.get("bitrate_mbps")),
                                    ("sync", st.get("sync", "off")))
                  if have != t[k]]
@@ -1054,7 +1103,7 @@ class RigPanel(QWidget):
         c.start_btn.setEnabled(bool(cams) and not busy)
         c.rec_btn.setText("■ Stop recording (all)" if recording else "● Record scene (all)")
         c.rec_btn.setEnabled(bool(cams) and (recording or "active" in states) and not busy)
-        for w in (c.mode, c.preset, c.preview_box, c.bitrate, self.sync_on, self.sync_master):
+        for w in (c.mode, c.preset, c.shutter, c.tnr, c.preview_box, c.bitrate, self.sync_on, self.sync_master):
             w.setEnabled(bool(cams) and not recording)
 
     # -- commands to every camera
@@ -1077,6 +1126,12 @@ class RigPanel(QWidget):
                 link.send("set_mode", mode=t["mode"])
             if st.get("preset") != t["preset"]:
                 link.send("set_preset", preset=t["preset"])
+            if st.get("shutter_us") != t["shutter"]:
+                link.send("set_shutter", lambda ok, r, l=link: ok or self.message.emit(f"{l.name}: {r}"),
+                          us=t["shutter"])
+            if st.get("tnr") != t["tnr"]:
+                link.send("set_tnr", lambda ok, r, l=link: ok or self.message.emit(f"{l.name}: {r}"),
+                          tnr=t["tnr"])
             if st.get("preview") != t["preview"]:
                 link.send("set_preview", enabled=t["preview"])
             if st.get("bitrate_mbps") != t["bitrate"]:
@@ -1093,7 +1148,8 @@ class RigPanel(QWidget):
             for l in cams:
                 l.send("set_bitrate", mbps=t["bitrate"])
             gather(cams, "start", lambda r: self._report("start", r),
-                   mode=t["mode"], preset=t["preset"], preview=t["preview"])
+                   mode=t["mode"], preset=t["preset"], preview=t["preview"], shutter_us=t["shutter"],
+                   tnr=t["tnr"])
 
     def _synced_master(self):
         """The sync master, if frame sync is on and the master is running as master."""
